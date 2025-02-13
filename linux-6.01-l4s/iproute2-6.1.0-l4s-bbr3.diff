@@ -1,0 +1,297 @@
+diff -u -p -r iproute2-6.1.0-l4s-bak/include/uapi/linux/inet_diag.h iproute2-6.1.0-l4s/include/uapi/linux/inet_diag.h
+--- iproute2-6.1.0-l4s-bak/include/uapi/linux/inet_diag.h	2022-12-14 09:42:22.000000000 -0800
++++ iproute2-6.1.0-l4s/include/uapi/linux/inet_diag.h	2024-11-18 11:35:43.660025467 -0800
+@@ -76,7 +76,7 @@ enum {
+  * to offset cc+"yes" or to offset cc+"no". "yes" is supposed to be
+  * length of the command and its arguments.
+  */
+- 
++
+ struct inet_diag_bc_op {
+ 	unsigned char	code;
+ 	unsigned char	yes;
+@@ -161,6 +161,8 @@ enum {
+ 	INET_DIAG_SK_BPF_STORAGES,
+ 	INET_DIAG_CGROUP_ID,
+ 	INET_DIAG_SOCKOPT,
++	INET_DIAG_PRAGUEINFO,
++	INET_DIAG_BBR3INFO,	/* request as INET_DIAG_VEGASINFO */
+ 	__INET_DIAG_MAX,
+ };
+ 
+@@ -231,9 +233,59 @@ struct tcp_bbr_info {
+ 	__u32	bbr_cwnd_gain;		/* cwnd gain shifted left 8 bits */
+ };
+ 
++struct tcp_prague_info {
++	__u64	prague_alpha;
++	__u64	prague_frac_cwnd;
++	__u64	prague_rate_bytes;
++	__u32	prague_max_burst;
++	__u32	prague_round;
++	__u32	prague_rtt_target;
++	bool	prague_enabled;
++};
++
++/* Phase as reported in netlink/ss stats. */
++enum tcp_bbr3_phase {
++	BBR3_PHASE_INVALID		= 0,
++	BBR3_PHASE_STARTUP		= 1,
++	BBR3_PHASE_DRAIN		= 2,
++	BBR3_PHASE_PROBE_RTT		= 3,
++	BBR3_PHASE_PROBE_BW_UP		= 4,
++	BBR3_PHASE_PROBE_BW_DOWN	= 5,
++	BBR3_PHASE_PROBE_BW_CRUISE	= 6,
++	BBR3_PHASE_PROBE_BW_REFILL	= 7
++};
++
++struct tcp_bbr3_info {
++	/* u64 bw: bandwidth (app throughput) estimate in Byte per sec: */
++	__u32	bbr_bw_lsb;		/* lower 32 bits of bw */
++	__u32	bbr_bw_msb;		/* upper 32 bits of bw */
++	__u32	bbr_min_rtt;		/* min-filtered RTT in uSec */
++	__u32	bbr_pacing_gain;	/* pacing gain shifted left 8 bits */
++	__u32	bbr_cwnd_gain;		/* cwnd gain shifted left 8 bits */
++	__u32	bbr_bw_hi_lsb;		/* lower 32 bits of bw_hi */
++	__u32	bbr_bw_hi_msb;		/* upper 32 bits of bw_hi */
++	__u32	bbr_bw_lo_lsb;		/* lower 32 bits of bw_lo */
++	__u32	bbr_bw_lo_msb;		/* upper 32 bits of bw_lo */
++	__u8	bbr_mode;		/* current bbr_mode in state machine */
++	__u8	bbr_phase;		/* current state machine phase */
++	__u8	unused1;		/* alignment padding; not used yet */
++	__u8	bbr_version;		/* MUST be at this offset in struct */
++	__u32	bbr_inflight_lo;	/* lower/short-term data volume bound */
++	__u32	bbr_inflight_hi;	/* higher/long-term data volume bound */
++	__u32	bbr_extra_acked;	/* max excess packets ACKed in epoch */
++	/* Jean II : instrumentation */
++	__u32	bbr_loss_thresh_cnt;	/* How many times over loss_thresh */
++	__u32	bbr_cap_inflight_hi_cnt; /* How many times cap is inflight_hi */
++	__u32	bbr_cap_inflight_lo_cnt; /* How many times cap is inflight_hi */
++	__u32	bbr_cap_headroom_cnt;	/* How many times cap is inflight_hi */
++	__u32	bbr_undo_cwnd_cnt;	/* How many times call undo_cwnd */
++};
++
+ union tcp_cc_info {
+ 	struct tcpvegas_info	vegas;
+ 	struct tcp_dctcp_info	dctcp;
++	struct tcp_prague_info	prague;
+ 	struct tcp_bbr_info	bbr;
++	struct tcp_bbr3_info	bbr3;
+ };
+ #endif /* _INET_DIAG_H_ */
+diff -u -p -r iproute2-6.1.0-l4s-bak/misc/ss.c iproute2-6.1.0-l4s/misc/ss.c
+--- iproute2-6.1.0-l4s-bak/misc/ss.c	2022-12-14 09:42:22.000000000 -0800
++++ iproute2-6.1.0-l4s/misc/ss.c	2024-11-18 11:37:41.973082741 -0800
+@@ -855,6 +855,16 @@ struct dctcpstat {
+ 	bool		enabled;
+ };
+ 
++struct praguestat {
++	uint64_t alpha;
++	uint64_t frac_cwnd;
++	uint64_t rate_bytes;
++	uint32_t max_burst;
++	uint32_t round;
++	uint32_t rtt_target;
++	bool enabled;
++};
++
+ struct tcpstat {
+ 	struct sockstat	    ss;
+ 	unsigned int	    timer;
+@@ -914,7 +924,9 @@ struct tcpstat {
+ 	bool		    has_wscale_opt;
+ 	bool		    app_limited;
+ 	struct dctcpstat    *dctcp;
++	struct praguestat   *prague;
+ 	struct tcp_bbr_info *bbr_info;
++	struct tcp_bbr3_info *bbr3_info;
+ };
+ 
+ /* SCTP assocs share the same inode number with their parent endpoint. So if we
+@@ -992,6 +1004,22 @@ static const char *tipc_netid_name(int t
+ 	}
+ }
+ 
++//static const char *prague_rtt_indep_mode(uint32_t rtt_indep)
++//{
++//	switch(rtt_indep) {
++//	case 0:
++//		return "disabled";
++//	case 1:
++//		return "rate";
++//	case 2:
++//		return "scalable";
++//	case 3:
++//		return "additive";
++//	default:
++//		return "???";
++//	}
++//}
++
+ /* Allocate and initialize a new buffer chunk */
+ static struct buf_chunk *buf_chunk_new(void)
+ {
+@@ -2588,6 +2616,29 @@ static void sctp_stats_print(struct sctp
+ 		out(" fraginl:%d", s->sctpi_s_frag_interleave);
+ }
+ 
++static const char* bbr3_phase_to_str(enum tcp_bbr3_phase phase)
++{
++	switch (phase) {
++	case BBR3_PHASE_STARTUP:
++		return "STARTUP";
++	case BBR3_PHASE_DRAIN:
++		return "DRAIN";
++	case BBR3_PHASE_PROBE_RTT:
++		return "PROBE_RTT";
++	case BBR3_PHASE_PROBE_BW_UP:
++		return "PROBE_BW_UP";
++	case BBR3_PHASE_PROBE_BW_DOWN:
++		return "PROBE_BW_DOWN";
++	case BBR3_PHASE_PROBE_BW_CRUISE:
++		return "PROBE_BW_CRUISE";
++	case BBR3_PHASE_PROBE_BW_REFILL:
++		return "PROBE_BW_REFILL";
++	case BBR3_PHASE_INVALID:
++	default:
++		return "INVALID";
++	}
++}
++
+ static void tcp_stats_print(struct tcpstat *s)
+ {
+ 	char b1[64];
+@@ -2660,6 +2711,18 @@ static void tcp_stats_print(struct tcpst
+ 		out(" dctcp:fallback_mode");
+ 	}
+ 
++	if (s->prague && s->prague->enabled) {
++		struct praguestat *prague = s->prague;
++
++		out(" prague:(alpha:%g%%,frac_cwnd:%lu,rate_bytes:%lu,"
++		    "max_burst:%u,round:%u,rtt_indep:%u)",
++		    (double)prague->alpha / (double)(1ULL << 20U) * 100.0f,
++		    prague->frac_cwnd, prague->rate_bytes,
++		    prague->max_burst, prague->round, prague->rtt_target);
++	} else if (s->prague) {
++		out(" prague:reno-fallback-mode");
++	}
++
+ 	if (s->bbr_info) {
+ 		__u64 bw;
+ 
+@@ -2679,6 +2742,62 @@ static void tcp_stats_print(struct tcpst
+ 		out(")");
+ 	}
+ 
++	if (s->bbr3_info) {
++		/* All versions of the BBR algorithm use the INET_DIAG_BBRINFO
++		 * enum value. Later versions of the tcp_bbr_info struct are
++		 * backward-compatible with earlier versions, to allow older ss
++		 * binaries to print basic information for newer versions of
++		 * the algorithm. We use the size of the returned tcp_bbr_info
++		 * struct to decide how much to print.
++		 */
++		/* The above is so broken that I had to fix it. Jean II */
++		__u64 bw, bw_hi, bw_lo;
++
++		bw = s->bbr3_info->bbr_bw_msb;
++		bw <<= 32;
++		bw |= s->bbr3_info->bbr_bw_lsb;
++
++		out(" bbr3:(bw:%sbps,mrtt:%g",
++		    sprint_bw(b1, bw * 8.0),
++		    (double)s->bbr3_info->bbr_min_rtt / 1000.0);
++		if (s->bbr3_info->bbr_pacing_gain)
++			out(",pacing_gain:%g",
++			    (double)s->bbr3_info->bbr_pacing_gain / 256.0);
++		if (s->bbr3_info->bbr_cwnd_gain)
++			out(",cwnd_gain:%g",
++			    (double)s->bbr3_info->bbr_cwnd_gain / 256.0);
++
++		bw_hi = s->bbr3_info->bbr_bw_hi_msb;
++		bw_hi <<= 32;
++		bw_hi |= s->bbr3_info->bbr_bw_hi_lsb;
++
++		bw_lo = s->bbr3_info->bbr_bw_lo_msb;
++		bw_lo <<= 32;
++		bw_lo |= s->bbr3_info->bbr_bw_lo_lsb;
++
++		out(",version:%u", s->bbr3_info->bbr_version);
++		if (bw_hi != ~0UL)
++			out(",bw_hi:%sbps", sprint_bw(b1, bw_hi * 8.0));
++		if (bw_lo != ~0UL)
++			out(",bw_lo:%sbps", sprint_bw(b1, bw_lo * 8.0));
++		if (s->bbr3_info->bbr_inflight_hi != ~0U)
++			out(",inflight_hi:%u", s->bbr3_info->bbr_inflight_hi);
++		if (s->bbr3_info->bbr_inflight_lo != ~0U)
++			out(",inflight_lo:%u", s->bbr3_info->bbr_inflight_lo);
++		out(",extra_acked:%u", s->bbr3_info->bbr_extra_acked);
++		out(",mode:%d", (int)s->bbr3_info->bbr_mode);
++		out(",phase:%s",
++		    bbr3_phase_to_str(
++			(enum tcp_bbr3_phase) s->bbr3_info->bbr_phase));
++		out(",loss_thresh:%u", s->bbr3_info->bbr_loss_thresh_cnt);
++		out(",cap_inflight_hi:%u", s->bbr3_info->bbr_cap_inflight_hi_cnt);
++		out(",cap_inflight_lo:%u", s->bbr3_info->bbr_cap_inflight_lo_cnt);
++		out(",cap_headroom:%u", s->bbr3_info->bbr_cap_headroom_cnt);
++		out(",undo_cwnd:%u", s->bbr3_info->bbr_undo_cwnd_cnt);
++
++		out(")");
++	}
++
+ 	if (s->send_bps)
+ 		out(" send %sbps", sprint_bw(b1, s->send_bps));
+ 	if (s->lastsnd)
+@@ -3142,6 +3261,23 @@ static void tcp_show_info(const struct n
+ 			s.dctcp		= dctcp;
+ 		}
+ 
++		if (tb[INET_DIAG_PRAGUEINFO]) {
++			struct praguestat *prague = malloc(sizeof(struct
++								  praguestat));
++
++			const struct tcp_prague_info *pinfo
++				= RTA_DATA(tb[INET_DIAG_PRAGUEINFO]);
++
++			prague->enabled	= !!pinfo->prague_enabled;
++			prague->alpha	= pinfo->prague_alpha;
++			prague->frac_cwnd = pinfo->prague_frac_cwnd;
++			prague->rate_bytes = pinfo->prague_rate_bytes;
++			prague->max_burst = pinfo->prague_max_burst;
++			prague->round = pinfo->prague_round;
++			prague->rtt_target = pinfo->prague_rtt_target;
++			s.prague	= prague;
++		}
++
+ 		if (tb[INET_DIAG_BBRINFO]) {
+ 			const void *bbr_info = RTA_DATA(tb[INET_DIAG_BBRINFO]);
+ 			int len = min(RTA_PAYLOAD(tb[INET_DIAG_BBRINFO]),
+@@ -3152,6 +3288,16 @@ static void tcp_show_info(const struct n
+ 				memcpy(s.bbr_info, bbr_info, len);
+ 		}
+ 
++		if (tb[INET_DIAG_BBR3INFO]) {
++			const void *bbr_info = RTA_DATA(tb[INET_DIAG_BBR3INFO]);
++			int len = min(RTA_PAYLOAD(tb[INET_DIAG_BBR3INFO]),
++				      sizeof(*s.bbr3_info));
++
++			s.bbr3_info = calloc(1, sizeof(*s.bbr3_info));
++			if (s.bbr3_info && bbr_info)
++				memcpy(s.bbr3_info, bbr_info, len);
++		}
++
+ 		if (rtt > 0 && info->tcpi_snd_mss && info->tcpi_snd_cwnd) {
+ 			s.send_bps = (double) info->tcpi_snd_cwnd *
+ 				(double)info->tcpi_snd_mss * 8000000. / rtt;
+@@ -3189,7 +3335,9 @@ static void tcp_show_info(const struct n
+ 		s.snd_wnd = info->tcpi_snd_wnd;
+ 		tcp_stats_print(&s);
+ 		free(s.dctcp);
++		free(s.prague);
+ 		free(s.bbr_info);
++		free(s.bbr3_info);
+ 	}
+ 	if (tb[INET_DIAG_MD5SIG]) {
+ 		struct tcp_diag_md5sig *sig = RTA_DATA(tb[INET_DIAG_MD5SIG]);

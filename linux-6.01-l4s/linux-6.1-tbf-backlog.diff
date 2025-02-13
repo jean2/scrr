@@ -1,0 +1,31 @@
+diff -u -p linux-6.1.94-qdisc/net/sched/sch_tbf.c linux-6.1.94-l4s/net/sched/sch_tbf.c
+--- linux-6.1.94-qdisc/net/sched/sch_tbf.c	2024-06-16 04:41:42.000000000 -0700
++++ linux-6.1.94-l4s/net/sched/sch_tbf.c	2024-07-02 11:33:19.676315939 -0700
+@@ -208,6 +208,7 @@ static int tbf_segment(struct sk_buff *s
+ 	struct sk_buff *segs, *nskb;
+ 	netdev_features_t features = netif_skb_features(skb);
+ 	unsigned int len = 0, prev_len = qdisc_pkt_len(skb);
++	unsigned int seg_len;
+ 	int ret, nb;
+ 
+ 	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
+@@ -219,16 +220,18 @@ static int tbf_segment(struct sk_buff *s
+ 	skb_list_walk_safe(segs, segs, nskb) {
+ 		skb_mark_not_on_list(segs);
+ 		qdisc_skb_cb(segs)->pkt_len = segs->len;
+-		len += segs->len;
++		seg_len = segs->len;
+ 		ret = qdisc_enqueue(segs, q->qdisc, to_free);
+ 		if (ret != NET_XMIT_SUCCESS) {
+ 			if (net_xmit_drop_count(ret))
+ 				qdisc_qstats_drop(sch);
+ 		} else {
+ 			nb++;
++			len += seg_len;
+ 		}
+ 	}
+ 	sch->q.qlen += nb;
++	sch->qstats.backlog += len;
+ 	if (nb > 1)
+ 		qdisc_tree_reduce_backlog(sch, 1 - nb, prev_len - len);
+ 	consume_skb(skb);

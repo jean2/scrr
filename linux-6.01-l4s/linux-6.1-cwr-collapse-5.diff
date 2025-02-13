@@ -1,0 +1,76 @@
+diff -u -p -r linux-6.1.94-deb/include/linux/tcp.h linux-6.1.94-l4s/include/linux/tcp.h
+--- linux-6.1.94-deb/include/linux/tcp.h	2024-06-16 04:41:42.000000000 -0700
++++ linux-6.1.94-l4s/include/linux/tcp.h	2024-06-26 15:16:47.880781332 -0700
+@@ -319,9 +319,9 @@ struct tcp_sock {
+ 	u32	snd_cwnd_used;
+ 	u32	snd_cwnd_stamp;
+ 	u32	prior_cwnd;	/* cwnd right before starting loss recovery */
+-	u32	prr_delivered;	/* Number of newly delivered packets to
++	s32	prr_delivered;	/* Number of newly delivered packets to
+ 				 * receiver in Recovery. */
+-	u32	prr_out;	/* Total number of pkts sent during Recovery. */
++	s32	prr_out;	/* Total number of pkts sent during Recovery. */
+ 	u32	delivered;	/* Total data packets delivered incl. rexmits */
+ 	u32	delivered_ce;	/* Like the above but only ECE marked packets */
+ 	u32	lost;		/* Total data packets lost incl. rexmits */
+diff -u -p -r linux-6.1.94-deb/net/ipv4/tcp_input.c linux-6.1.94-l4s/net/ipv4/tcp_input.c
+--- linux-6.1.94-deb/net/ipv4/tcp_input.c	2024-06-16 04:41:42.000000000 -0700
++++ linux-6.1.94-l4s/net/ipv4/tcp_input.c	2024-06-26 16:00:49.988233980 -0700
+@@ -2637,21 +2637,55 @@ static void tcp_init_cwnd_reduction(stru
+ 
+ void tcp_cwnd_reduction(struct sock *sk, int newly_acked_sacked, int newly_lost, int flag)
+ {
++	const struct inet_connection_sock *icsk = inet_csk(sk);
+ 	struct tcp_sock *tp = tcp_sk(sk);
+ 	int sndcnt = 0;
+ 	int delta = tp->snd_ssthresh - tcp_packets_in_flight(tp);
++	int defer;
+ 
+ 	if (newly_acked_sacked <= 0 || WARN_ON_ONCE(!tp->prior_cwnd))
+ 		return;
+ 
++	/* If we are operating in pure ECN-CE mode (no losses), we need
++	 * to take into account TSO deferral.
++	 * TSO batches packet, and to do that it defers sending packets.
++	 * Those packets are not counted by tcp_packets_in_flight(tp)
++	 * nor tp->prr_out, and as the result we underestimates what
++	 * has already been commited for sending.
++	 * We only need to account TSO deferral in pure ECN-CE mode, as TSO
++	 * is disabled after losses, see tcp_tso_should_defer(). Jean II */
++	if (icsk->icsk_ca_state < TCP_CA_Recovery) {
++		/* Estimate the number of deferred TSO packets.
++		 * This is a rough approximation of the number of TSO deferral.
++		 * If there are losses, this will underestimate, and may go
++		 * negative, but we check that above. Jean II */
++		defer = ( tp->snd_cwnd - tp->packets_out - tp->retrans_out
++			  - newly_acked_sacked );
++		defer = max(defer, 0);
++
++		/* If there are deferred packets before we enter CWR, those
++		 * packets should not get counted towards PRR.
++		 * So, substract them from PRR by reducing prr_out,
++		 * this way prr_out only count packet after those pending.
++		 * This avoid dropping cwnd by up to tcp_tso_segs() at the
++		 * start of CWR. Substract one pending to force immediate
++		 * shrinkage of cwnd by one. Jean II */
++		if (tp->prr_delivered == 0)
++			tp->prr_out -= max(defer - 1, 0);
++	} else
++		defer = 0;
++
+ 	tp->prr_delivered += newly_acked_sacked;
+-	if (delta < 0) {
++	if ( (delta - defer) < 0) {
++		/* RFC 6937 - Reduce cwnd smoothly until it reaches ssthresh. */
+ 		u64 dividend = (u64)tp->snd_ssthresh * tp->prr_delivered +
+ 			       tp->prior_cwnd - 1;
+ 		sndcnt = div_u64(dividend, tp->prior_cwnd) - tp->prr_out;
+ 	} else {
+ 		sndcnt = max_t(int, tp->prr_delivered - tp->prr_out,
+-			       newly_acked_sacked);
++			       newly_acked_sacked + defer);
++		/* RFC 6937 - PRR-SSRB - Slow Start Reduction Bound.
++		 * Increase cwnd smoothly until it reaches ssthresh. */
+ 		if (flag & FLAG_SND_UNA_ADVANCED && !newly_lost)
+ 			sndcnt++;
+ 		sndcnt = min(delta, sndcnt);
